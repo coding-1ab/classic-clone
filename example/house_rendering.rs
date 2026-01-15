@@ -7,6 +7,79 @@ use std::mem;
 use std::ptr;
 use std::ffi::CString;
 
+// --- 카메라 상태 ---
+struct Camera {
+    position: Vec3,
+    yaw: f32,   // Y축 회전 (좌우 시점) - 라디안
+    pitch: f32, // X축 회전 (상하 시점) - 라디안
+    move_speed: f32,
+    rotate_speed: f32,
+}
+
+impl Camera {
+    fn new() -> Self {
+        Camera {
+            position: Vec3::new(0.0, 0.0, 2.5), // 초기 카메라 위치 (물체 앞)
+            yaw: 0.0,
+            pitch: 0.0,
+            move_speed: 0.05,
+            rotate_speed: 0.03, // 회전 속도 (라디안)
+        }
+    }
+
+    fn move_forward(&mut self) {
+        self.position.z -= self.move_speed;
+    }
+
+    fn move_backward(&mut self) {
+        self.position.z += self.move_speed;
+    }
+
+    fn move_left(&mut self) {
+        self.position.x -= self.move_speed;
+    }
+
+    fn move_right(&mut self) {
+        self.position.x += self.move_speed;
+    }
+
+    fn move_up(&mut self) {
+        self.position.y += self.move_speed;
+    }
+
+    fn move_down(&mut self) {
+        self.position.y -= self.move_speed;
+    }
+
+    // 시점 회전 (WASD)
+    fn look_up(&mut self) {
+        self.pitch += self.rotate_speed;
+        // 시점 제한 (90도 이상 넘어가지 않도록)
+        self.pitch = self.pitch.clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
+    }
+
+    fn look_down(&mut self) {
+        self.pitch -= self.rotate_speed;
+        self.pitch = self.pitch.clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
+    }
+
+    fn look_left(&mut self) {
+        self.yaw -= self.rotate_speed;
+    }
+
+    fn look_right(&mut self) {
+        self.yaw += self.rotate_speed;
+    }
+
+    fn get_view_matrix(&self) -> Mat4 {
+        // 뷰 행렬: 회전 후 이동 (카메라 변환의 역변환)
+        // 순서: 이동의 역 -> pitch 회전의 역 -> yaw 회전의 역
+        let translation = Mat4::from_translation(-self.position);
+        let rotation = Mat4::from_rotation_x(-self.pitch) * Mat4::from_rotation_y(-self.yaw);
+        rotation * translation
+    }
+}
+
 // --- 상수 정의 ---
 const GRID_SIZE: usize = 5;
 const BLOCK_SIZE: f32 = 0.2; // 1.0 / 5.0
@@ -62,6 +135,9 @@ fn main() {
     window.make_current();
     window.set_key_polling(true);
 
+    // 카메라 초기화
+    let mut camera = Camera::new();
+
     // 2. GL 로딩
     gl::load_with(|s| {
         window.get_proc_address(s)
@@ -114,10 +190,64 @@ fn main() {
     }
 
     // 6. 렌더링 루프
+    println!("=== 조작법 ===");
+    println!("[이동]");
+    println!("  ↑: 앞으로 이동");
+    println!("  ↓: 뒤로 이동");
+    println!("  ←: 왼쪽으로 이동");
+    println!("  →: 오른쪽으로 이동");
+    println!("  Space: 위로 이동 (Y+)");
+    println!("  Shift: 아래로 이동 (Y-)");
+    println!("[시점 회전]");
+    println!("  W: 위쪽 보기");
+    println!("  S: 아래쪽 보기");
+    println!("  A: 왼쪽 보기");
+    println!("  D: 오른쪽 보기");
+    println!("[종료]");
+    println!("  ESC: 종료");
+
     while !window.should_close() {
         for (_, event) in glfw::flush_messages(&events) {
-            if let glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) = event {
-                window.set_should_close(true);
+            match event {
+                glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
+                    window.set_should_close(true);
+                }
+                // 방향키 - 앞/뒤/좌/우 이동
+                glfw::WindowEvent::Key(Key::Up, _, Action::Press | Action::Repeat, _) => {
+                    camera.move_forward();
+                }
+                glfw::WindowEvent::Key(Key::Down, _, Action::Press | Action::Repeat, _) => {
+                    camera.move_backward();
+                }
+                glfw::WindowEvent::Key(Key::Left, _, Action::Press | Action::Repeat, _) => {
+                    camera.move_left();
+                }
+                glfw::WindowEvent::Key(Key::Right, _, Action::Press | Action::Repeat, _) => {
+                    camera.move_right();
+                }
+                // 스페이스바 - 위로 이동 (Y+)
+                glfw::WindowEvent::Key(Key::Space, _, Action::Press | Action::Repeat, _) => {
+                    camera.move_up();
+                }
+                // 쉬프트 - 아래로 이동 (Y-)
+                glfw::WindowEvent::Key(Key::LeftShift, _, Action::Press | Action::Repeat, _) |
+                glfw::WindowEvent::Key(Key::RightShift, _, Action::Press | Action::Repeat, _) => {
+                    camera.move_down();
+                }
+                // WASD - 시점 회전
+                glfw::WindowEvent::Key(Key::W, _, Action::Press | Action::Repeat, _) => {
+                    camera.look_up();
+                }
+                glfw::WindowEvent::Key(Key::S, _, Action::Press | Action::Repeat, _) => {
+                    camera.look_down();
+                }
+                glfw::WindowEvent::Key(Key::A, _, Action::Press | Action::Repeat, _) => {
+                    camera.look_right();
+                }
+                glfw::WindowEvent::Key(Key::D, _, Action::Press | Action::Repeat, _) => {
+                    camera.look_left();
+                }
+                _ => {}
             }
         }
 
@@ -127,16 +257,14 @@ fn main() {
 
             gl::UseProgram(shader_program);
 
-            let time = glfw.get_time() as f32;
-
-            // Model: Y축 기준 지속 회전
-            let model = Mat4::from_rotation_y(time) * Mat4::from_rotation_z(0.3); // X축 살짝 기울여서 입체감 주기
+            // Model: 고정 (회전 없음)
+            let model = Mat4::IDENTITY;
             
-            // View: 카메라 약간 뒤로
-            let view = Mat4::from_translation(Vec3::new(0.0, 0.0, -2.5));
+            // View: 카메라 위치에 따른 뷰 행렬
+            let view = camera.get_view_matrix();
             
             // Projection
-            let projection = Mat4::perspective_rh_gl(45.0f32.to_radians(), 800.0 / 600.0, 0.1, 100.0);
+            let projection = Mat4::perspective_rh_gl(45.0f32.to_radians(), 240.0 / 180.0, 0.1, 100.0);
 
             set_mat4(shader_program, "model", &model);
             set_mat4(shader_program, "view", &view);
