@@ -75,8 +75,18 @@ impl Camera {
         // 뷰 행렬: 회전 후 이동 (카메라 변환의 역변환)
         // 순서: 이동의 역 -> pitch 회전의 역 -> yaw 회전의 역
         let translation = Mat4::from_translation(-self.position);
-        let rotation = Mat4::from_rotation_x(-self.pitch) * Mat4::from_rotation_y(-self.yaw);
+        let rotation = Mat4::from_rotation_x(-self.pitch) * Mat4::from_rotation_y(self.yaw);
         rotation * translation
+    }
+    
+    // 카메라가 바라보는 방향 벡터 반환
+    fn get_forward_direction(&self) -> Vec3 {
+        // 기본 방향은 -Z (OpenGL 관례)
+        // yaw와 pitch를 적용하여 실제 바라보는 방향 계산
+        let x = self.yaw.sin() * self.pitch.cos();
+        let y = self.pitch.sin();
+        let z = -self.yaw.cos() * self.pitch.cos();
+        Vec3::new(x, y, z).normalize()
     }
 }
 
@@ -121,6 +131,25 @@ const FRAGMENT_SHADER_SRC: &str = r#"
     }
 "#;
 
+// 크로스헤어용 셰이더 (2D)
+const CROSSHAIR_VERTEX_SHADER_SRC: &str = r#"
+    #version 330 core
+    layout (location = 0) in vec2 aPos;
+
+    void main() {
+        gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+"#;
+
+const CROSSHAIR_FRAGMENT_SHADER_SRC: &str = r#"
+    #version 330 core
+    out vec4 FragColor;
+
+    void main() {
+        FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+    }
+"#;
+
 fn main() {
     // 1. GLFW 초기화
     let mut glfw = glfw::init(glfw::fail_on_errors).unwrap();
@@ -147,46 +176,60 @@ fn main() {
 
     // 3. 데이터 생성 (월드 데이터 & 팔레트)
     let (world_data, palette) = init_data();
-
-    // 4. 메싱 (Meshing): 데이터를 정점 배열로 변환
-    // 위치(3) + 색상(3) = 6 floats per vertex
-    let vertices = generate_mesh(&world_data, &palette);
     
-    // 생성된 정점이 없다면(전부 공기라면) 종료 방지용 더미 데이터
-    if vertices.is_empty() {
-        println!("Warning: Mesh is empty!");
-    } else {
-        println!("Generated Vertices Count: {}", vertices.len() / 6);
-        println!("Generated Triangles Count: {}", vertices.len() / 6 / 3);
-    }
+    // 선택된 블록 추적 (이전 프레임에서 선택된 블록)
+    let mut selected_block: Option<(usize, usize, usize)> = None;
 
     let (mut vbo, mut vao) = (0, 0);
+    let (mut crosshair_vbo, mut crosshair_vao) = (0, 0);
     let shader_program;
+    let crosshair_shader_program;
+    
+    // 크로스헤어 정점 데이터 (화면 중앙에 + 모양)
+    let crosshair_size = 0.03; // NDC 좌표 기준 크기
+    let crosshair_vertices: [f32; 8] = [
+        // 수평선
+        -crosshair_size, 0.0,
+        crosshair_size, 0.0,
+        // 수직선
+        0.0, -crosshair_size,
+        0.0, crosshair_size,
+    ];
     
     unsafe {
         gl::Enable(gl::DEPTH_TEST); // 깊이 테스트 켜기 (앞이 뒤를 가리도록)
 
         shader_program = create_shader_program();
+        crosshair_shader_program = create_crosshair_shader_program();
 
+        // 메인 복셀 VAO/VBO
         gl::GenVertexArrays(1, &mut vao);
         gl::GenBuffers(1, &mut vbo);
 
         gl::BindVertexArray(vao);
         gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-        
-        // Vec<f32> 데이터를 GPU로 전송
-        gl::BufferData(
-            gl::ARRAY_BUFFER,
-            (vertices.len() * mem::size_of::<f32>()) as isize,
-            vertices.as_ptr() as *const _,
-            gl::STATIC_DRAW,
-        );
 
         let stride = (6 * mem::size_of::<f32>()) as i32;
         gl::VertexAttribPointer(0, 3, gl::FLOAT, gl::FALSE, stride, ptr::null()); // Pos
         gl::EnableVertexAttribArray(0);
         gl::VertexAttribPointer(1, 3, gl::FLOAT, gl::FALSE, stride, (3 * mem::size_of::<f32>()) as *const _); // Color
         gl::EnableVertexAttribArray(1);
+        
+        // 크로스헤어 VAO/VBO
+        gl::GenVertexArrays(1, &mut crosshair_vao);
+        gl::GenBuffers(1, &mut crosshair_vbo);
+        
+        gl::BindVertexArray(crosshair_vao);
+        gl::BindBuffer(gl::ARRAY_BUFFER, crosshair_vbo);
+        gl::BufferData(
+            gl::ARRAY_BUFFER,
+            (crosshair_vertices.len() * mem::size_of::<f32>()) as isize,
+            crosshair_vertices.as_ptr() as *const _,
+            gl::STATIC_DRAW,
+        );
+        
+        gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, (2 * mem::size_of::<f32>()) as i32, ptr::null());
+        gl::EnableVertexAttribArray(0);
     }
 
     // 6. 렌더링 루프
@@ -242,19 +285,31 @@ fn main() {
                     camera.look_down();
                 }
                 glfw::WindowEvent::Key(Key::A, _, Action::Press | Action::Repeat, _) => {
-                    camera.look_right();
+                    camera.look_left();
                 }
                 glfw::WindowEvent::Key(Key::D, _, Action::Press | Action::Repeat, _) => {
-                    camera.look_left();
+                    camera.look_right();
                 }
                 _ => {}
             }
         }
+        
+        // 레이캐스팅으로 현재 바라보는 블록 찾기
+        let new_selected = raycast_block(&camera, &world_data, 10.0);
+        
+        // 선택된 블록이 변경되었을 때만 메시 재생성
+        if new_selected != selected_block {
+            selected_block = new_selected;
+        }
+        
+        // 메시 생성 (선택된 블록은 팔레트 5번으로 표시)
+        let vertices = generate_mesh_with_selection(&world_data, &palette, selected_block);
 
         unsafe {
             gl::ClearColor(0.1, 0.1, 0.1, 1.0);
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
 
+            // --- 복셀 렌더링 ---
             gl::UseProgram(shader_program);
 
             // Model: 고정 (회전 없음)
@@ -270,9 +325,25 @@ fn main() {
             set_mat4(shader_program, "view", &view);
             set_mat4(shader_program, "projection", &projection);
 
+            // 메시 데이터 업데이트
             gl::BindVertexArray(vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (vertices.len() * mem::size_of::<f32>()) as isize,
+                vertices.as_ptr() as *const _,
+                gl::DYNAMIC_DRAW,
+            );
+            
             // 삼각형 개수 = 전체 float 개수 / 6(속성수)
             gl::DrawArrays(gl::TRIANGLES, 0, (vertices.len() / 6) as i32);
+            
+            // --- 크로스헤어 렌더링 ---
+            gl::Disable(gl::DEPTH_TEST); // 크로스헤어는 항상 맨 앞에
+            gl::UseProgram(crosshair_shader_program);
+            gl::BindVertexArray(crosshair_vao);
+            gl::DrawArrays(gl::LINES, 0, 4); // 2개의 선 (4개 정점)
+            gl::Enable(gl::DEPTH_TEST);
         }
 
         window.swap_buffers();
@@ -281,7 +352,8 @@ fn main() {
 }
 
 // --- 데이터 초기화 함수 ---
-fn init_data() -> ([[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE], [[[f32; 3]; 6]; 5]) {
+#[allow(dead_code)]
+fn init_data() -> ([[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE], [[[f32; 3]; 6]; 6]) {
     // 1. 월드 데이터 초기화 (임의의 모양 생성)
     let mut world = [[[0u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE];
 
@@ -317,7 +389,7 @@ fn init_data() -> ([[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE], [[[f32; 3]; 6]; 5]
     // 2. 팔레트 정의 (블록 ID별 6면 색상)
     // [ID][FACE][RGB]
     // 0번은 공기이므로 정의는 하지만 쓰이지 않음.
-    let mut palette = [[[0.0; 3]; 6]; 5];
+    let mut palette = [[[0.0; 3]; 6]; 6];
 
     // 색상 생성 헬퍼
     let make_color = |r, g, b| [r, g, b];
@@ -345,14 +417,27 @@ fn init_data() -> ([[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE], [[[f32; 3]; 6]; 5]
     ];
     // ID 4: 노랑 (핵)
     palette[4] = [make_color(1.0, 1.0, 0.0); 6]; // 모든 면이 샛노랑
+    
+    // ID 5: 회색 (선택된 블록 하이라이트용)
+    palette[5] = [make_color(0.6, 0.6, 0.6); 6]; // 모든 면이 회색
 
     (world, palette)
 }
 
 // --- 핵심: 메싱 알고리즘 (Face Culling) ---
+#[allow(dead_code)]
 fn generate_mesh(
     world: &[[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE],
-    palette: &[[[f32; 3]; 6]; 5]
+    palette: &[[[f32; 3]; 6]; 6]
+) -> Vec<f32> {
+    generate_mesh_with_selection(world, palette, None)
+}
+
+// 선택된 블록을 고려한 메싱 알고리즘
+fn generate_mesh_with_selection(
+    world: &[[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE],
+    palette: &[[[f32; 3]; 6]; 6],
+    selected: Option<(usize, usize, usize)>,
 ) -> Vec<f32> {
     let mut vertices = Vec::new();
 
@@ -361,33 +446,40 @@ fn generate_mesh(
             for z in 0..GRID_SIZE {
                 let block_id = world[x][y][z];
                 if block_id == 0 { continue; } // 공기는 그리지 않음
+                
+                // 선택된 블록이면 팔레트 5번 사용, 아니면 원래 팔레트 사용
+                let palette_id = if selected == Some((x, y, z)) {
+                    5usize
+                } else {
+                    block_id as usize
+                };
 
                 // 6면 검사 (Face Culling)
                 // 이웃이 그리드 밖이거나(경계면), 이웃이 공기(0)일 때만 그림
                 
                 // +x (Right)
                 if x + 1 >= GRID_SIZE || world[x+1][y][z] == 0 {
-                    add_face(&mut vertices, x, y, z, FACE_RIGHT, palette[block_id as usize][FACE_RIGHT]);
+                    add_face(&mut vertices, x, y, z, FACE_RIGHT, palette[palette_id][FACE_RIGHT]);
                 }
                 // -x (Left)
                 if x == 0 || world[x-1][y][z] == 0 {
-                    add_face(&mut vertices, x, y, z, FACE_LEFT, palette[block_id as usize][FACE_LEFT]);
+                    add_face(&mut vertices, x, y, z, FACE_LEFT, palette[palette_id][FACE_LEFT]);
                 }
                 // +y (Top)
                 if y + 1 >= GRID_SIZE || world[x][y+1][z] == 0 {
-                    add_face(&mut vertices, x, y, z, FACE_TOP, palette[block_id as usize][FACE_TOP]);
+                    add_face(&mut vertices, x, y, z, FACE_TOP, palette[palette_id][FACE_TOP]);
                 }
                 // -y (Bottom)
                 if y == 0 || world[x][y-1][z] == 0 {
-                    add_face(&mut vertices, x, y, z, FACE_BOTTOM, palette[block_id as usize][FACE_BOTTOM]);
+                    add_face(&mut vertices, x, y, z, FACE_BOTTOM, palette[palette_id][FACE_BOTTOM]);
                 }
                 // +z (Front)
                 if z + 1 >= GRID_SIZE || world[x][y][z+1] == 0 {
-                    add_face(&mut vertices, x, y, z, FACE_FRONT, palette[block_id as usize][FACE_FRONT]);
+                    add_face(&mut vertices, x, y, z, FACE_FRONT, palette[palette_id][FACE_FRONT]);
                 }
                 // -z (Back)
                 if z == 0 || world[x][y][z-1] == 0 {
-                    add_face(&mut vertices, x, y, z, FACE_BACK, palette[block_id as usize][FACE_BACK]);
+                    add_face(&mut vertices, x, y, z, FACE_BACK, palette[palette_id][FACE_BACK]);
                 }
             }
         }
@@ -468,6 +560,44 @@ fn add_face(vertices: &mut Vec<f32>, ix: usize, iy: usize, iz: usize, face_idx: 
     }
 }
 
+// --- 레이캐스팅: 카메라가 바라보는 블록 찾기 ---
+fn raycast_block(
+    camera: &Camera,
+    world: &[[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE],
+    max_distance: f32,
+) -> Option<(usize, usize, usize)> {
+    let ray_origin = camera.position;
+    let ray_dir = camera.get_forward_direction();
+    
+    // DDA (Digital Differential Analyzer) 알고리즘 사용
+    let step_size = 0.02; // 레이 진행 스텝 크기
+    let mut t = 0.0;
+    
+    while t < max_distance {
+        let point = ray_origin + ray_dir * t;
+        
+        // 월드 좌표를 그리드 인덱스로 변환
+        let ix = ((point.x - WORLD_ORIGIN) / BLOCK_SIZE).floor() as i32;
+        let iy = ((point.y - WORLD_ORIGIN) / BLOCK_SIZE).floor() as i32;
+        let iz = ((point.z - WORLD_ORIGIN) / BLOCK_SIZE).floor() as i32;
+        
+        // 그리드 범위 내인지 확인
+        if ix >= 0 && ix < GRID_SIZE as i32 &&
+           iy >= 0 && iy < GRID_SIZE as i32 &&
+           iz >= 0 && iz < GRID_SIZE as i32 {
+            let block_id = world[ix as usize][iy as usize][iz as usize];
+            if block_id != 0 {
+                // 공기가 아닌 블록 발견
+                return Some((ix as usize, iy as usize, iz as usize));
+            }
+        }
+        
+        t += step_size;
+    }
+    
+    None // 블록을 찾지 못함
+}
+
 // --- GL Helper Functions ---
 unsafe fn create_shader_program() -> u32 {
     let vertex_shader = unsafe { compile_shader(VERTEX_SHADER_SRC, gl::VERTEX_SHADER) };
@@ -496,4 +626,19 @@ unsafe fn set_mat4(program: u32, name: &str, mat: &Mat4) {
     let c_name = CString::new(name).unwrap();
     let loc = unsafe { gl::GetUniformLocation(program, c_name.as_ptr()) };
     unsafe { gl::UniformMatrix4fv(loc, 1, gl::FALSE, mat.to_cols_array().as_ptr()) };
+}
+
+unsafe fn create_crosshair_shader_program() -> u32 {
+    let vertex_shader = unsafe { compile_shader(CROSSHAIR_VERTEX_SHADER_SRC, gl::VERTEX_SHADER) };
+    let fragment_shader = unsafe { compile_shader(CROSSHAIR_FRAGMENT_SHADER_SRC, gl::FRAGMENT_SHADER) };
+    
+    let program = unsafe { gl::CreateProgram() };
+    unsafe { gl::AttachShader(program, vertex_shader) };
+    unsafe { gl::AttachShader(program, fragment_shader) };
+    unsafe { gl::LinkProgram(program) };
+    
+    unsafe { gl::DeleteShader(vertex_shader) };
+    unsafe { gl::DeleteShader(fragment_shader) };
+    
+    program
 }
