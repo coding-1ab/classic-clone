@@ -1,5 +1,6 @@
-mod level;
 mod game;
+mod level;
+mod player;
 
 use glfw::{Action, Context, Key};
 

@@ -13,8 +13,8 @@ struct Chunk {
 
 type SlotSize = u8;
 
-struct PlayerData {
-    position: Vec3,
+pub struct PlayerData {
+    pub position: Vec3,
     facing: Vec2,
     selected_slot: SlotSize,
     inventory: [Slot; 9],
