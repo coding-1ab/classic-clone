@@ -9,3 +9,4 @@ version = "*"
 [dependencies]
 glam = "0.30.10"
 gl = "0.14"
+fastnbt = "2.6.0"
