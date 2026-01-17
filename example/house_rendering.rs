@@ -163,6 +163,7 @@ fn main() {
 
     window.make_current();
     window.set_key_polling(true);
+    window.set_mouse_button_polling(true); // 마우스 버튼 이벤트 활성화
 
     // 카메라 초기화
     let mut camera = Camera::new();
@@ -175,10 +176,13 @@ fn main() {
     });
 
     // 3. 데이터 생성 (월드 데이터 & 팔레트)
-    let (world_data, palette) = init_data();
+    let (mut world_data, palette) = init_data();
     
-    // 선택된 블록 추적 (이전 프레임에서 선택된 블록)
-    let mut selected_block: Option<(usize, usize, usize)> = None;
+    // 선택된 블록 추적 (블록 좌표, 선택된 면 방향)
+    let mut selected_block: Option<(usize, usize, usize, usize)> = None; // (x, y, z, face)
+    
+    // 현재 선택된 팔레트 (1~4, 기본값 1)
+    let mut current_palette: u8 = 1;
 
     let (mut vbo, mut vao) = (0, 0);
     let (mut crosshair_vbo, mut crosshair_vao) = (0, 0);
@@ -246,8 +250,18 @@ fn main() {
     println!("  S: 아래쪽 보기");
     println!("  A: 왼쪽 보기");
     println!("  D: 오른쪽 보기");
+    println!("[블록 조작]");
+    println!("  마우스 좌클릭: 블록 삭제");
+    println!("  마우스 우클릭: 블록 추가");
+    println!("[팔레트 선택]");
+    println!("  1: 빨간색 블록");
+    println!("  2: 초록색 블록");
+    println!("  3: 파란색 블록");
+    println!("  4: 노란색 블록");
     println!("[종료]");
     println!("  ESC: 종료");
+    println!();
+    println!("현재 팔레트: {}", current_palette);
 
     while !window.should_close() {
         for (_, event) in glfw::flush_messages(&events) {
@@ -290,12 +304,52 @@ fn main() {
                 glfw::WindowEvent::Key(Key::D, _, Action::Press | Action::Repeat, _) => {
                     camera.look_right();
                 }
+                // 숫자키 1~4 - 팔레트 선택
+                glfw::WindowEvent::Key(Key::Num1, _, Action::Press, _) => {
+                    current_palette = 1;
+                    println!("팔레트 변경: 1 (빨간색)");
+                }
+                glfw::WindowEvent::Key(Key::Num2, _, Action::Press, _) => {
+                    current_palette = 2;
+                    println!("팔레트 변경: 2 (초록색)");
+                }
+                glfw::WindowEvent::Key(Key::Num3, _, Action::Press, _) => {
+                    current_palette = 3;
+                    println!("팔레트 변경: 3 (파란색)");
+                }
+                glfw::WindowEvent::Key(Key::Num4, _, Action::Press, _) => {
+                    current_palette = 4;
+                    println!("팔레트 변경: 4 (노란색)");
+                }
+                // 마우스 좌클릭 - 블록 삭제
+                glfw::WindowEvent::MouseButton(glfw::MouseButtonLeft, Action::Press, _) => {
+                    if let Some((x, y, z, _face)) = selected_block {
+                        // 선택된 블록을 공기(0)로 변경
+                        world_data[x][y][z] = 0;
+                        println!("블록 삭제: ({}, {}, {})", x, y, z);
+                    }
+                }
+                // 마우스 우클릭 - 블록 추가
+                glfw::WindowEvent::MouseButton(glfw::MouseButtonRight, Action::Press, _) => {
+                    if let Some((x, y, z, face)) = selected_block {
+                        // 선택된 면의 반대 방향에 블록 추가
+                        let (nx, ny, nz) = get_neighbor_position(x, y, z, face);
+                        
+                        // 범위 체크 및 공기 블록인지 확인
+                        if nx < GRID_SIZE && ny < GRID_SIZE && nz < GRID_SIZE {
+                            if world_data[nx][ny][nz] == 0 {
+                                world_data[nx][ny][nz] = current_palette; // 현재 선택된 팔레트로 설정
+                                println!("블록 추가: ({}, {}, {}) - 팔레트 {}", nx, ny, nz, current_palette);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         
-        // 레이캐스팅으로 현재 바라보는 블록 찾기
-        let new_selected = raycast_block(&camera, &world_data, 10.0);
+        // 레이캐스팅으로 현재 바라보는 블록 찾기 (면 방향 포함)
+        let new_selected = raycast_block_with_face(&camera, &world_data, 10.0);
         
         // 선택된 블록이 변경되었을 때만 메시 재생성
         if new_selected != selected_block {
@@ -303,7 +357,8 @@ fn main() {
         }
         
         // 메시 생성 (선택된 블록은 팔레트 5번으로 표시)
-        let vertices = generate_mesh_with_selection(&world_data, &palette, selected_block);
+        let selected_pos = selected_block.map(|(x, y, z, _)| (x, y, z));
+        let vertices = generate_mesh_with_selection(&world_data, &palette, selected_pos);
 
         unsafe {
             gl::ClearColor(0.1, 0.1, 0.1, 1.0);
@@ -561,17 +616,28 @@ fn add_face(vertices: &mut Vec<f32>, ix: usize, iy: usize, iz: usize, face_idx: 
 }
 
 // --- 레이캐스팅: 카메라가 바라보는 블록 찾기 ---
+#[allow(dead_code)]
 fn raycast_block(
     camera: &Camera,
     world: &[[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE],
     max_distance: f32,
 ) -> Option<(usize, usize, usize)> {
+    raycast_block_with_face(camera, world, max_distance).map(|(x, y, z, _)| (x, y, z))
+}
+
+// 레이캐스팅: 블록과 선택된 면 방향 반환
+fn raycast_block_with_face(
+    camera: &Camera,
+    world: &[[[u8; GRID_SIZE]; GRID_SIZE]; GRID_SIZE],
+    max_distance: f32,
+) -> Option<(usize, usize, usize, usize)> {
     let ray_origin = camera.position;
     let ray_dir = camera.get_forward_direction();
     
     // DDA (Digital Differential Analyzer) 알고리즘 사용
     let step_size = 0.02; // 레이 진행 스텝 크기
     let mut t = 0.0;
+    let mut prev_point = ray_origin;
     
     while t < max_distance {
         let point = ray_origin + ray_dir * t;
@@ -587,15 +653,56 @@ fn raycast_block(
            iz >= 0 && iz < GRID_SIZE as i32 {
             let block_id = world[ix as usize][iy as usize][iz as usize];
             if block_id != 0 {
-                // 공기가 아닌 블록 발견
-                return Some((ix as usize, iy as usize, iz as usize));
+                // 공기가 아닌 블록 발견 - 어느 면에서 진입했는지 계산
+                let face = determine_hit_face(prev_point, point, ix, iy, iz);
+                return Some((ix as usize, iy as usize, iz as usize, face));
             }
         }
         
+        prev_point = point;
         t += step_size;
     }
     
     None // 블록을 찾지 못함
+}
+
+// 레이가 블록의 어느 면에서 진입했는지 결정
+fn determine_hit_face(prev_point: Vec3, _current_point: Vec3, ix: i32, iy: i32, iz: i32) -> usize {
+    // 블록의 중심 좌표 계산
+    let block_center_x = WORLD_ORIGIN + (ix as f32 + 0.5) * BLOCK_SIZE;
+    let block_center_y = WORLD_ORIGIN + (iy as f32 + 0.5) * BLOCK_SIZE;
+    let block_center_z = WORLD_ORIGIN + (iz as f32 + 0.5) * BLOCK_SIZE;
+    
+    // 이전 점에서 블록 중심까지의 방향
+    let dx = prev_point.x - block_center_x;
+    let dy = prev_point.y - block_center_y;
+    let dz = prev_point.z - block_center_z;
+    
+    // 가장 큰 절대값을 가진 축이 진입한 면
+    let abs_dx = dx.abs();
+    let abs_dy = dy.abs();
+    let abs_dz = dz.abs();
+    
+    if abs_dx >= abs_dy && abs_dx >= abs_dz {
+        if dx > 0.0 { FACE_RIGHT } else { FACE_LEFT }
+    } else if abs_dy >= abs_dx && abs_dy >= abs_dz {
+        if dy > 0.0 { FACE_TOP } else { FACE_BOTTOM }
+    } else {
+        if dz > 0.0 { FACE_FRONT } else { FACE_BACK }
+    }
+}
+
+// 선택된 면의 이웃 블록 위치 계산
+fn get_neighbor_position(x: usize, y: usize, z: usize, face: usize) -> (usize, usize, usize) {
+    match face {
+        FACE_RIGHT => (x + 1, y, z),      // +x 방향
+        FACE_LEFT => (x.saturating_sub(1), y, z),   // -x 방향
+        FACE_TOP => (x, y + 1, z),        // +y 방향
+        FACE_BOTTOM => (x, y.saturating_sub(1), z), // -y 방향
+        FACE_FRONT => (x, y, z + 1),      // +z 방향
+        FACE_BACK => (x, y, z.saturating_sub(1)),   // -z 방향
+        _ => (x, y, z),
+    }
 }
 
 // --- GL Helper Functions ---
